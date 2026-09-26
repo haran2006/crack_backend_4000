@@ -1,8 +1,8 @@
 """
 FastAPI Crack Detection Backend for Render.com
 ===============================================
-Loads YOLOv8 crack segmentation model (best.pt) and serves POST /detect endpoint.
-Automatically binds to Render's dynamic PORT environment variable.
+Loads lightweight ONNX/YOLO crack segmentation model (best.onnx / best.pt)
+and serves POST /detect endpoint.
 """
 
 import base64
@@ -21,9 +21,10 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 from ultralytics import YOLO
 
-MODEL_PATH = Path("best.pt")
+# Prefer best.onnx (lightweight, low RAM), fallback to best.pt
+MODEL_PATH = Path("best.onnx") if Path("best.onnx").exists() else Path("best.pt")
 CONF_THRESHOLD = 0.05
-IMAGE_SIZE = 1280
+IMAGE_SIZE = 640
 PORT = int(os.environ.get("PORT", 8000))
 
 app = FastAPI(title="Smart Crack Detection API")
@@ -38,7 +39,7 @@ app.add_middleware(
 
 print(f"Loading model from {MODEL_PATH.resolve()} …")
 model = YOLO(str(MODEL_PATH))
-MODEL_NAME = "YOLO Segmentation (Render Cloud)"
+MODEL_NAME = f"YOLO Segmentation ({MODEL_PATH.name} Cloud)"
 print(f"Model loaded successfully! Task={model.task} Classes={model.names}")
 
 
