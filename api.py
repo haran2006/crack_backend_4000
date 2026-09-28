@@ -106,12 +106,15 @@ def highest_severity(results: list) -> str:
     return best
 
 
-def pil_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
+def pil_to_data_url(img: Image.Image, quality: int = 80) -> str:
+    out_img = img
+    if max(img.size) > 1280:
+        out_img = img.copy()
+        out_img.thumbnail((1280, 1280), Image.Resampling.BILINEAR)
     buf = io.BytesIO()
-    img.save(buf, format=fmt)
+    out_img.save(buf, format="JPEG", quality=quality)
     b64 = base64.b64encode(buf.getvalue()).decode()
-    mime = "image/png" if fmt == "PNG" else "image/jpeg"
-    return f"data:{mime};base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}"
 
 
 def file_size_label(n_bytes: int) -> str:
