@@ -30,9 +30,9 @@ IMAGE_SIZE = 640
 PORT = int(os.environ.get("PORT", 8000))
 
 CLASSES = {
-    0: "crack-dedection-2",
-    1: "damaged",
-    2: "n",
+    0: "Crack",
+    1: "Damaged",
+    2: "NIL",
 }
 
 CLASS_COLORS = {
@@ -202,10 +202,12 @@ async def detect(images: List[UploadFile] = File(...)):
 
                 color = CLASS_COLORS.get(cls_id, (0, 229, 255))
                 draw.rectangle([draw_x1, draw_y1, draw_x2, draw_y2], outline=color, width=3)
-                label_txt = f"{class_name} {int(conf_val * 100)}%"
+                # Use human-readable label on image
+                display_names = {"Crack": "Crack", "Damaged": "Damaged", "NIL": "No Crack"}
+                label_txt = f"{display_names.get(class_name, class_name)} {int(conf_val * 100)}%"
                 draw.text((draw_x1 + 4, max(0, draw_y1 - 14)), label_txt, fill=color)
 
-        has_crack = any(r["className"] in ["crack-dedection-2", "damaged"] for r in regions)
+        has_crack = any(r["className"] in ["Crack", "Damaged"] for r in regions)
         max_conf = max((r["confidence"] for r in regions), default=0.0)
         avg_conf = sum(r["confidence"] for r in regions) / len(regions) if regions else 0.0
         region_count = len(regions)
