@@ -36,9 +36,9 @@ CLASSES = {
 }
 
 CLASS_COLORS = {
-    0: (0, 229, 255),    # Cyan for cracks
-    1: (255, 179, 0),    # Amber for damaged
-    2: (186, 104, 200),  # Purple for normal / other
+    0: (255, 0, 50),     # Neon Red for cracks
+    1: (186, 104, 200),  # Purple for damaged
+    2: (0, 229, 255),    # Cyan/Blue for n
 }
 
 app = FastAPI(title="Smart Crack Detection API (Cloud)")
@@ -205,7 +205,7 @@ async def detect(images: List[UploadFile] = File(...)):
                 label_txt = f"{class_name} {int(conf_val * 100)}%"
                 draw.text((draw_x1 + 4, max(0, draw_y1 - 14)), label_txt, fill=color)
 
-        has_crack = len(regions) > 0
+        has_crack = any(r["className"] in ["crack-dedection-2", "damaged"] for r in regions)
         max_conf = max((r["confidence"] for r in regions), default=0.0)
         avg_conf = sum(r["confidence"] for r in regions) / len(regions) if regions else 0.0
         region_count = len(regions)
