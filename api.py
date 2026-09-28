@@ -1,8 +1,9 @@
 """
-FastAPI Crack Detection Backend for Render.com
-===============================================
-Loads lightweight ONNX/YOLO crack segmentation model (best.onnx / best.pt)
-and serves POST /detect endpoint.
+FastAPI Crack Detection Backend for Render.com (Ultra-Lightweight ONNX)
+======================================================================
+Pure onnxruntime + numpy + pillow implementation.
+Zero PyTorch / Ultralytics dependencies to keep memory < 200 MB
+and prevent Render 512 MB Out-Of-Memory (OOM) crashes.
 """
 
 import base64
@@ -14,20 +15,33 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
+import onnxruntime as ort
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image
-from ultralytics import YOLO
+from PIL import Image, ImageDraw
 
-# Prefer best.onnx (lightweight, low RAM), fallback to best.pt
-MODEL_PATH = Path("best.onnx") if Path("best.onnx").exists() else Path("best.pt")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "best.onnx"
 CONF_THRESHOLD = 0.05
+IOU_THRESHOLD = 0.45
 IMAGE_SIZE = 640
 PORT = int(os.environ.get("PORT", 8000))
 
-app = FastAPI(title="Smart Crack Detection API")
+CLASSES = {
+    0: "crack-dedection-2",
+    1: "damaged",
+    2: "n",
+}
+
+CLASS_COLORS = {
+    0: (0, 229, 255),    # Cyan for cracks
+    1: (255, 179, 0),    # Amber for damaged
+    2: (186, 104, 200),  # Purple for normal / other
+}
+
+app = FastAPI(title="Smart Crack Detection API (Cloud)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,10 +51,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"Loading model from {MODEL_PATH.resolve()} …")
-model = YOLO(str(MODEL_PATH))
-MODEL_NAME = f"YOLO Segmentation ({MODEL_PATH.name} Cloud)"
-print(f"Model loaded successfully! Task={model.task} Classes={model.names}")
+print(f"Initializing pure ONNX Runtime session with {MODEL_PATH} ...")
+ort_session = ort.InferenceSession(
+    str(MODEL_PATH),
+    providers=["CPUExecutionProvider"]
+)
+input_name = ort_session.get_inputs()[0].name
+print("ONNX Runtime initialized successfully without PyTorch! Ready for inference.")
+
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float = 0.45) -> List[int]:
+    """Pure NumPy Non-Maximum Suppression."""
+    if len(boxes) == 0:
+        return []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(ovr <= iou_thresh)[0]
+        order = order[inds + 1]
+    return keep
 
 
 def severity_for(region_count: int, confidence: float) -> str:
@@ -86,43 +130,77 @@ async def detect(images: List[UploadFile] = File(...)):
     for idx, upload in enumerate(images):
         raw = await upload.read()
         pil_img = Image.open(io.BytesIO(raw)).convert("RGB")
-        img_array = np.array(pil_img)
+        orig_w, orig_h = pil_img.size
 
-        yolo_results = model.predict(
-            source=img_array,
-            conf=CONF_THRESHOLD,
-            imgsz=IMAGE_SIZE,
-            retina_masks=True,
-            save=False,
-            verbose=False,
-        )
-        result = yolo_results[0]
+        # Preprocess for ONNX (resize to 640x640, normalize to 0..1, CHW)
+        resized = pil_img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.BILINEAR)
+        img_np = np.array(resized, dtype=np.float32) / 255.0
+        img_np = np.transpose(img_np, (2, 0, 1))  # (3, 640, 640)
+        inp = np.expand_dims(img_np, axis=0)      # (1, 3, 640, 640)
 
-        annotated_bgr = result.plot(boxes=True, labels=True, conf=True, masks=True)
-        annotated_rgb = annotated_bgr[:, :, ::-1]
-        annotated_pil = Image.fromarray(annotated_rgb)
-        annotated_url = pil_to_data_url(annotated_pil)
-        original_url = pil_to_data_url(pil_img)
+        # Run ONNX inference
+        outputs = ort_session.run(None, {input_name: inp})
+        pred = outputs[0][0].T  # shape: (8400, 39)
 
-        boxes = result.boxes
-        img_w, img_h = pil_img.size
+        boxes_xywh = pred[:, :4]
+        scores = pred[:, 4:7]
+
+        class_ids = np.argmax(scores, axis=1)
+        confidences = np.max(scores, axis=1)
+
+        # Filter by confidence threshold
+        conf_mask = confidences >= CONF_THRESHOLD
+        boxes_xywh = boxes_xywh[conf_mask]
+        confidences = confidences[conf_mask]
+        class_ids = class_ids[conf_mask]
+
         regions = []
+        annotated_pil = pil_img.copy()
+        draw = ImageDraw.Draw(annotated_pil)
 
-        if boxes is not None and len(boxes) > 0:
-            for i, box in enumerate(boxes):
-                conf_val = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                class_name = model.names[cls_id]
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
+        if len(confidences) > 0:
+            # Convert xywh in 640 space to xyxy
+            x1 = np.clip(boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2.0, 0, IMAGE_SIZE)
+            y1 = np.clip(boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2.0, 0, IMAGE_SIZE)
+            x2 = np.clip(boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2.0, 0, IMAGE_SIZE)
+            y2 = np.clip(boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2.0, 0, IMAGE_SIZE)
+            boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+
+            # Non-Maximum Suppression
+            keep_idx = nms(boxes_xyxy, confidences, IOU_THRESHOLD)
+
+            for i, k in enumerate(keep_idx):
+                conf_val = float(confidences[k])
+                cls_id = int(class_ids[k])
+                class_name = CLASSES.get(cls_id, f"class_{cls_id}")
+
+                bx = boxes_xyxy[k]
+                # Scale percentages relative to image dimensions
+                pct_x = float((bx[0] / IMAGE_SIZE) * 100)
+                pct_y = float((bx[1] / IMAGE_SIZE) * 100)
+                pct_w = float(((bx[2] - bx[0]) / IMAGE_SIZE) * 100)
+                pct_h = float(((bx[3] - bx[1]) / IMAGE_SIZE) * 100)
+
                 regions.append({
                     "id": f"{upload.filename}-region-{i}",
-                    "x": (x1 / img_w) * 100,
-                    "y": (y1 / img_h) * 100,
-                    "width": ((x2 - x1) / img_w) * 100,
-                    "height": ((y2 - y1) / img_h) * 100,
+                    "x": pct_x,
+                    "y": pct_y,
+                    "width": pct_w,
+                    "height": pct_h,
                     "confidence": conf_val,
                     "className": class_name,
                 })
+
+                # Draw bounding box on annotated copy
+                draw_x1 = (pct_x / 100.0) * orig_w
+                draw_y1 = (pct_y / 100.0) * orig_h
+                draw_x2 = ((pct_x + pct_w) / 100.0) * orig_w
+                draw_y2 = ((pct_y + pct_h) / 100.0) * orig_h
+
+                color = CLASS_COLORS.get(cls_id, (0, 229, 255))
+                draw.rectangle([draw_x1, draw_y1, draw_x2, draw_y2], outline=color, width=3)
+                label_txt = f"{class_name} {int(conf_val * 100)}%"
+                draw.text((draw_x1 + 4, max(0, draw_y1 - 14)), label_txt, fill=color)
 
         has_crack = len(regions) > 0
         max_conf = max((r["confidence"] for r in regions), default=0.0)
@@ -139,8 +217,8 @@ async def detect(images: List[UploadFile] = File(...)):
             "id": f"{upload.filename}-{idx}-{int(t_start)}",
             "fileName": upload.filename,
             "fileSizeLabel": file_size_label(len(raw)),
-            "imageUrl": original_url,
-            "annotatedUrl": annotated_url,
+            "imageUrl": pil_to_data_url(pil_img),
+            "annotatedUrl": pil_to_data_url(annotated_pil),
             "hasCrack": has_crack,
             "regions": regions,
             "confidence": round(avg_conf * 1000) / 10,
@@ -159,7 +237,7 @@ async def detect(images: List[UploadFile] = File(...)):
         ) / 10 if results_out else 0,
         "highestSeverity": highest_severity(results_out),
         "processingTimeSeconds": elapsed,
-        "model": MODEL_NAME,
+        "model": "YOLO Segmentation (best.onnx Cloud)",
     }
 
     return JSONResponse({"results": results_out, "summary": summary})
@@ -167,7 +245,7 @@ async def detect(images: List[UploadFile] = File(...)):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "model": MODEL_NAME}
+    return {"status": "ok", "model": "YOLO Segmentation (best.onnx Cloud)"}
 
 
 if __name__ == "__main__":
