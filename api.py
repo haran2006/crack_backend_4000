@@ -216,12 +216,17 @@ async def detect(images: List[UploadFile] = File(...)):
             total_area_pct = sum(r["width"] * r["height"] for r in regions) / 10000
             crack_m = round(math.sqrt(total_area_pct) * 5.0, 2)
 
+        # Create side-by-side image for download
+        side_by_side = Image.new("RGB", (orig_w * 2, orig_h))
+        side_by_side.paste(pil_img, (0, 0))
+        side_by_side.paste(annotated_pil, (orig_w, 0))
+
         results_out.append({
             "id": f"{upload.filename}-{idx}-{int(t_start)}",
             "fileName": upload.filename,
             "fileSizeLabel": file_size_label(len(raw)),
             "imageUrl": pil_to_data_url(pil_img),
-            "annotatedUrl": pil_to_data_url(annotated_pil),
+            "annotatedUrl": pil_to_data_url(side_by_side),
             "hasCrack": has_crack,
             "regions": regions,
             "confidence": round(avg_conf * 1000) / 10,
